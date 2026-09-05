@@ -3,12 +3,17 @@
 A beginner-friendly Terraform project that provisions a small, self-contained
 AWS environment: a VPC with two public and two private subnets (across two
 AZs), an Application Load Balancer, an Auto Scaling Group of EC2 instances
-running nginx behind it, and a private MySQL RDS database the instances can
-reach but the internet can't.
+running nginx behind it, a private MySQL RDS database the instances can
+reach but the internet can't, and CloudWatch alarms that email you if
+something looks wrong.
 
 This README explains not just *how* to run it, but *what* each piece is,
 so it doubles as a learning guide if you're new to Terraform or AWS
 networking.
+
+**When you're done experimenting, see [TEARDOWN.md](TEARDOWN.md)** for the
+exact, ordered steps to remove everything (including the remote state
+backend) so you stop being billed.
 
 ---
 
@@ -89,6 +94,9 @@ In AWS terms, this project creates:
 | Random password | `random_password` | Generates the RDS master password — never a plaintext variable |
 | Secrets Manager secret | `aws_secretsmanager_secret` + `..._secret_version` | Stores the generated username/password |
 | RDS instance | `aws_db_instance` | MySQL 8.0, `db.t4g.micro`, 20 GB gp3, single-AZ, in the private subnets |
+| SNS topic | `aws_sns_topic` + `aws_sns_topic_subscription` | Emails `alert_email` when a CloudWatch alarm fires (or recovers) |
+| CPU alarm | `aws_cloudwatch_metric_alarm` | Fires when the ASG's average CPU exceeds `cpu_alarm_threshold` (70%) for 5 minutes |
+| Unhealthy host alarm | `aws_cloudwatch_metric_alarm` | Fires when the ALB target group reports more than `unhealthy_host_alarm_threshold` (0) unhealthy hosts |
 
 ---
 
@@ -96,10 +104,12 @@ In AWS terms, this project creates:
 
 ```
 .
-├── providers.tf              # Which cloud provider (AWS) and version to use
-├── variables.tf               # All configurable inputs (region, CIDRs, your IP, etc.)
-├── main.tf                     # Calls the vpc and ec2 modules and wires them together
-├── outputs.tf                  # Values printed after apply (the instance's public IP)
+├── providers.tf              # Which cloud providers (AWS, random) and versions to use
+├── variables.tf               # All configurable inputs (region, CIDRs, your IP, your email, etc.)
+├── main.tf                     # Calls all the modules and wires them together
+├── outputs.tf                  # Values printed after apply (ALB DNS name, RDS endpoint, etc.)
+├── backend.tf.example           # Template for backend.tf — see § 11 (Remote state)
+├── TEARDOWN.md                  # Ordered steps to destroy everything and stop being billed
 ├── modules/
 │   ├── vpc/                    # Reusable module: VPC, 2 public + 2 private subnets, IGW, route tables
 │   │   ├── main.tf
@@ -117,20 +127,33 @@ In AWS terms, this project creates:
 │   │   ├── outputs.tf
 │   │   ├── versions.tf
 │   │   └── user_data.sh        # Installs & starts nginx on first boot
-│   └── rds/                    # Reusable module: RDS MySQL, DB subnet group, RDS security group, Secrets Manager
+│   ├── rds/                    # Reusable module: RDS MySQL, DB subnet group, RDS security group, Secrets Manager
+│   │   ├── main.tf
+│   │   ├── variables.tf
+│   │   ├── outputs.tf
+│   │   └── versions.tf
+│   └── monitoring/              # Reusable module: SNS topic + email subscription, CloudWatch alarms
 │       ├── main.tf
 │       ├── variables.tf
 │       ├── outputs.tf
 │       └── versions.tf
+├── bootstrap/                    # Standalone config: creates the S3 bucket + DynamoDB table for remote state (see § 11)
+│   ├── main.tf
+│   ├── variables.tf
+│   ├── outputs.tf
+│   └── providers.tf
+├── .github/workflows/
+│   └── terraform.yml             # CI: fmt/init/validate/plan (+ PR comment) on PRs, apply on merge to main
 ├── .gitignore                  # Files Terraform generates locally that shouldn't be committed
 └── .terraform.lock.hcl         # Records exact provider versions used (should be committed)
 ```
 
 The root project doesn't create any AWS resources directly — `main.tf` just
-calls the four modules under `modules/` and passes values between them
+calls the five modules under `modules/` and passes values between them
 (e.g. the VPC's subnet IDs into the ALB/EC2/RDS modules, the ALB's security
-group/target group into the EC2 module, and the EC2 module's security
-group into the RDS module). Terraform reads every `.tf` file within a
+group/target group into the EC2 module, the EC2 module's security group
+into the RDS module, and the ASG name/ALB and target group ARN suffixes
+into the monitoring module). Terraform reads every `.tf` file within a
 single directory as one combined configuration, but a `module` block is a
 deliberate boundary: each module in `modules/` is a self-contained,
 reusable unit with its own inputs (`variables.tf`) and outputs
@@ -167,20 +190,21 @@ Before you start, you need:
 
 ---
 
-## 4. Required input: `my_ip_cidr`
+## 4. Required inputs: `my_ip_cidr` and `alert_email`
 
-For security, SSH (port 22) is **not** open to the whole internet — you must
-explicitly tell Terraform your own IP address. This is intentional: there's
-no default value, so you can't accidentally deploy with SSH open to
-`0.0.0.0/0`.
+These two variables have no default — Terraform will refuse to `plan` or
+`apply` without them, on purpose in both cases.
+
+**`my_ip_cidr`**: SSH (port 22) is **not** open to the whole internet — you
+must explicitly tell Terraform your own IP address, so you can't
+accidentally deploy with SSH open to `0.0.0.0/0`.
 
 Find your public IP:
 ```bash
 curl -s ifconfig.me
 ```
 
-Then pass it as a `/32` CIDR (meaning "exactly this one address") when you
-run any Terraform command that touches infrastructure, e.g.:
+Then pass it as a `/32` CIDR (meaning "exactly this one address"):
 ```bash
 -var="my_ip_cidr=203.0.113.5/32"
 ```
@@ -188,6 +212,16 @@ run any Terraform command that touches infrastructure, e.g.:
 If your home/office IP changes (common with most home internet), you'll
 need to re-run `terraform apply` with the new value to keep SSH access
 working.
+
+**`alert_email`**: the address CloudWatch alarms notify via SNS. There's no
+default so an apply can't accidentally start emailing someone who never
+agreed to it:
+```bash
+-var="alert_email=you@example.com"
+```
+After the first `apply`, AWS sends a confirmation email to this address —
+**alarms won't actually deliver until you click the link in it.** Check
+your inbox (and spam folder) right after applying.
 
 ---
 
@@ -224,31 +258,35 @@ Shows you **exactly what Terraform intends to create, change, or destroy**,
 without actually doing it. Always read the plan before applying — this is
 your safety check.
 ```bash
-terraform plan -var="my_ip_cidr=203.0.113.5/32"
+terraform plan -var="my_ip_cidr=203.0.113.5/32" -var="alert_email=you@example.com"
 ```
 
 ### 5.5 `terraform apply`
 Actually creates the resources in AWS. It shows the same plan as above and
 asks you to type `yes` to confirm.
 ```bash
-terraform apply -var="my_ip_cidr=203.0.113.5/32"
+terraform apply -var="my_ip_cidr=203.0.113.5/32" -var="alert_email=you@example.com"
 ```
-When it finishes, it prints the `alb_dns_name` output. Give the ASG a
-minute or two afterward to finish booting its first instance and pass the
-ALB's health check before traffic actually succeeds.
+When it finishes, it prints the `alb_dns_name` output (among others — see
+§ 7). Give the ASG a minute or two afterward to finish booting its first
+instance and pass the ALB's health check before traffic actually succeeds,
+and check your email for the SNS subscription confirmation link (§ 4).
 
 ### 5.6 `terraform destroy`
-Tears down **everything** this project created. Use this when you're done
-experimenting, to avoid ongoing AWS charges.
+Tears down **everything** this project created. See
+**[TEARDOWN.md](TEARDOWN.md)** for the full ordered teardown (including the
+remote state backend, if you set one up) — the short version, for just the
+resources in this directory:
 ```bash
-terraform destroy -var="my_ip_cidr=203.0.113.5/32"
+terraform destroy -var="my_ip_cidr=203.0.113.5/32" -var="alert_email=you@example.com"
 ```
 
 > **Tip for repeated commands:** instead of typing `-var=...` every time,
 > create a file named `terraform.tfvars` (already excluded from git by
 > `.gitignore`, since it can contain sensitive values):
 > ```hcl
-> my_ip_cidr = "203.0.113.5/32"
+> my_ip_cidr  = "203.0.113.5/32"
+> alert_email = "you@example.com"
 > ```
 > Terraform loads `terraform.tfvars` automatically, so you can just run
 > `terraform plan` / `terraform apply` / `terraform destroy` with no flags.
@@ -306,6 +344,9 @@ ssh -i /path/to/your-key.pem ec2-user@<instance_public_ip>
 | `db_name` | `appdb` | Initial database created on the RDS instance |
 | `db_username` | `dbadmin` | RDS master username (the password is generated randomly — see § 8) |
 | `db_backup_retention_days` | `0` | Days of automated RDS backups to keep; `0` disables them |
+| `alert_email` | *(required, no default)* | Email CloudWatch alarms notify via SNS — see § 4 |
+| `cpu_alarm_threshold` | `70` | ASG average CPU % that triggers the alarm |
+| `unhealthy_host_alarm_threshold` | `0` | Unhealthy host count that triggers the alarm |
 
 To use an existing key pair, pass it the same way as `my_ip_cidr`:
 ```bash
@@ -404,6 +445,12 @@ If you're new to Terraform, here's what each building block means:
   typed into a variable. Secrets Manager is a separate AWS service for
   actually *storing* secrets like that password, so applications (or you)
   can look them up by name/ARN instead of it living in a config file.
+- **CloudWatch alarm / SNS topic** — a CloudWatch alarm watches one metric
+  (like `CPUUtilization`) and changes state (OK → ALARM, or back) when it
+  crosses a threshold you define; on its own, that state change is silent.
+  An SNS topic is what actually *does* something about it — the alarm
+  publishes to the topic, and the topic fans that out to every subscriber
+  (here, one email address).
 
 ---
 
@@ -416,8 +463,13 @@ Application Load Balancer has its own separate (smaller) free-tier
 allowance for the first 12 months. **Outside the free tier, or after it
 expires, the ALB, RDS instance, and any running EC2 instances all incur
 charges for as long as they exist** — the ALB and RDS both bill hourly even
-if the ASG has scaled down to a single small instance. Run
-`terraform destroy` when you're done to avoid unexpected costs.
+if the ASG has scaled down to a single small instance. CloudWatch alarms
+and SNS email notifications are effectively free at this scale (a
+generous free tier covers far more than 2 alarms and a handful of emails),
+so they don't meaningfully change the cost picture. Run
+[TEARDOWN.md](TEARDOWN.md)'s steps when you're done to avoid unexpected
+costs — a plain `terraform destroy` here only covers this directory, not
+the remote state backend if you set one up.
 
 ---
 
@@ -539,3 +591,10 @@ own state and can no longer cleanly plan or destroy its resources.
   this shouldn't happen here since `recovery_window_in_days = 0` deletes
   the secret immediately on destroy, but if you changed that, AWS keeps a
   deleted secret's name reserved for up to 30 days by default.
+- **Never received a CloudWatch alarm email** — check spam/junk first;
+  otherwise you likely never clicked the SNS subscription confirmation
+  link AWS sent to `alert_email` right after `apply`. Until that's
+  confirmed, the subscription sits in "pending" and delivers nothing, even
+  though `terraform apply` succeeds either way. Re-check with:
+  `aws sns list-subscriptions-by-topic --topic-arn $(terraform output -raw sns_topic_arn)`
+  — look for `"SubscriptionArn": "PendingConfirmation"`.

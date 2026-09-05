@@ -8,6 +8,14 @@ data "aws_caller_identity" "current" {}
 resource "aws_s3_bucket" "terraform_state" {
   bucket = "${var.project_name}-tfstate-${data.aws_caller_identity.current.account_id}"
 
+  # Versioning below means every state write leaves an old version behind —
+  # without force_destroy, `terraform destroy` on this bucket fails with
+  # "BucketNotEmpty" the moment it's ever held a state file. This trades a
+  # little safety for actually being able to tear this down cleanly, which
+  # matters for a learning project you expect to fully delete. See
+  # TEARDOWN.md for the destroy order this depends on.
+  force_destroy = true
+
   tags = {
     Name    = "${var.project_name}-tfstate"
     Purpose = "Terraform remote state"

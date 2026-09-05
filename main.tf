@@ -1,5 +1,5 @@
 # The root module doesn't create any AWS resources directly — it just wires
-# together four reusable child modules and passes the values each one
+# together five reusable child modules and passes the values each one
 # needs. A `module` block is like calling a function: `source` says where
 # the module's code lives, and every other argument fills in one of that
 # module's variables.
@@ -60,4 +60,17 @@ module "rds" {
   db_name                 = var.db_name
   db_username             = var.db_username
   backup_retention_period = var.db_backup_retention_days
+}
+
+module "monitoring" {
+  source = "./modules/monitoring"
+
+  alert_email = var.alert_email
+
+  asg_name                = module.ec2.asg_name
+  alb_arn_suffix          = module.alb.alb_arn_suffix
+  target_group_arn_suffix = module.alb.target_group_arn_suffix
+
+  cpu_alarm_threshold            = var.cpu_alarm_threshold
+  unhealthy_host_alarm_threshold = var.unhealthy_host_alarm_threshold
 }

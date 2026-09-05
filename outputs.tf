@@ -18,3 +18,8 @@ output "rds_secret_arn" {
   description = "ARN of the Secrets Manager secret holding the RDS master username/password. Retrieve it with: aws secretsmanager get-secret-value --secret-id <this arn> --query SecretString --output text"
   value       = module.rds.rds_secret_arn
 }
+
+output "sns_topic_arn" {
+  description = "ARN of the SNS topic CloudWatch alarms publish to. Check your email for a confirmation link after the first apply — alarms won't deliver until it's clicked."
+  value       = module.monitoring.sns_topic_arn
+}

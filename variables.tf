@@ -139,3 +139,29 @@ variable "db_backup_retention_days" {
   type        = number
   default     = 0
 }
+
+# --- Monitoring ---
+
+# No default on purpose — same reasoning as my_ip_cidr: guessing or
+# hardcoding an email address risks notifying someone unintended.
+variable "alert_email" {
+  description = "Email address CloudWatch alarms notify via SNS. Required — no default. AWS emails a confirmation link here after apply; alarms won't deliver until you click it."
+  type        = string
+
+  validation {
+    condition     = can(regex("^[^@\\s]+@[^@\\s]+\\.[^@\\s]+$", var.alert_email))
+    error_message = "alert_email must look like a valid email address, e.g. you@example.com."
+  }
+}
+
+variable "cpu_alarm_threshold" {
+  description = "ASG average CPU utilization (%) that triggers the CloudWatch alarm."
+  type        = number
+  default     = 70
+}
+
+variable "unhealthy_host_alarm_threshold" {
+  description = "Unhealthy host count that triggers the CloudWatch alarm."
+  type        = number
+  default     = 0
+}
