@@ -1,9 +1,9 @@
 # bongo-dev-terraform01
 
 A beginner-friendly Terraform project that provisions a small, self-contained
-AWS environment: a VPC with a public and private subnet, an EC2 instance
-running nginx in the public subnet, and the networking/security needed to
-reach it over HTTP and SSH.
+AWS environment: a VPC with two public subnets (across two AZs) and a
+private subnet, an Application Load Balancer, and an Auto Scaling Group of
+EC2 instances running nginx behind it.
 
 This README explains not just *how* to run it, but *what* each piece is,
 so it doubles as a learning guide if you're new to Terraform or AWS
@@ -14,40 +14,48 @@ networking.
 ## 1. What gets created
 
 ```
-                         Internet
-                             │
-                             │
-                     ┌───────▼────────┐
-                     │ Internet       │
-                     │ Gateway (IGW)  │
-                     └───────┬────────┘
-                             │
-   VPC  10.0.0.0/16          │
-  ┌──────────────────────────┼───────────────────────────┐
-  │                          │                            │
-  │   ┌──────────────────────▼─────────────────────┐      │
-  │   │  Public Route Table (0.0.0.0/0 → IGW)       │      │
-  │   └──────────────────────┬─────────────────────┘      │
-  │                          │                             │
-  │   ┌──────────────────────▼─────────────────────┐       │
-  │   │  Public Subnet   10.0.1.0/24                │       │
-  │   │                                              │       │
-  │   │   ┌────────────────────────────────────┐    │       │
-  │   │   │  EC2 instance (t3.micro)            │    │       │
-  │   │   │  Amazon Linux 2023 + nginx          │    │       │
-  │   │   │  Security Group:                    │    │       │
-  │   │   │    - allow TCP 22  from YOUR IP     │    │       │
-  │   │   │    - allow TCP 80  from anywhere    │    │       │
-  │   │   └────────────────────────────────────┘    │       │
-  │   └──────────────────────────────────────────────┘      │
-  │                                                          │
-  │   ┌──────────────────────────────────────────────┐      │
-  │   │  Private Subnet  10.0.2.0/24                  │      │
-  │   │  (no route to the internet — empty for now,   │      │
-  │   │   scaffolding for things like a database)     │      │
-  │   └────────────────────────────────────────────────┘    │
-  │                                                          │
-  └──────────────────────────────────────────────────────────┘
+                                Internet
+                                    │
+                        ┌───────────┴───────────┐
+                        │                        │
+                ┌───────▼────────┐               │
+                │ Internet       │               │
+                │ Gateway (IGW)  │               │
+                └───────┬────────┘               │
+                        │                         │
+   VPC  10.0.0.0/16     │                         │  HTTP :80
+  ┌─────────────────────┼─────────────────────────┼────────────┐
+  │                      │                         │            │
+  │   ┌──────────────────▼─────────────────┐   ┌───▼─────────┐  │
+  │   │  Public Route Table (0.0.0.0/0→IGW) │   │ ALB SG:     │  │
+  │   └──────────────────┬──────────────────┘   │ 80 from any │  │
+  │                       │                      └─────┬───────┘  │
+  │        ┌──────────────┴──────────────┐              │          │
+  │        │                              │      ┌───────▼───────┐  │
+  │  ┌─────▼──────────┐          ┌────────▼────┐ │  Application   │  │
+  │  │ Public Subnet 1│          │Public Subnet2│ │  Load Balancer │  │
+  │  │ 10.0.1.0/24     │          │10.0.3.0/24  │ │  (2 AZs)       │  │
+  │  │ AZ a            │          │AZ b         │ └───────┬───────┘  │
+  │  └────────┬────────┘          └──────┬──────┘         │          │
+  │           │                          │          Target Group     │
+  │           │                          │        (health check "/") │
+  │           └────────────┬─────────────┘                │          │
+  │                        │                               │          │
+  │              ┌─────────▼─────────────────────────────▼─┐        │
+  │              │  Auto Scaling Group (min 1 / max 2)      │        │
+  │              │  EC2 instances (t3.micro, AL2023 + nginx)│        │
+  │              │  Instance SG:                            │        │
+  │              │    - 22  from YOUR IP                    │        │
+  │              │    - 80  from the ALB's security group   │        │
+  │              └───────────────────────────────────────────┘        │
+  │                                                                    │
+  │   ┌──────────────────────────────────────────────┐               │
+  │   │  Private Subnet  10.0.2.0/24                  │               │
+  │   │  (no route to the internet — empty for now,   │               │
+  │   │   scaffolding for things like a database)     │               │
+  │   └────────────────────────────────────────────────┘             │
+  │                                                                    │
+  └────────────────────────────────────────────────────────────────────┘
 ```
 
 In AWS terms, this project creates:
@@ -56,12 +64,17 @@ In AWS terms, this project creates:
 |---|---|---|
 | VPC | `aws_vpc` | An isolated network with its own private IP range |
 | Internet Gateway | `aws_internet_gateway` | Connects the VPC to the public internet |
-| Public subnet | `aws_subnet` | Where the EC2 instance lives; can reach/be reached from the internet |
+| Public subnets (×2) | `aws_subnet` | One per AZ; host the ALB and the ASG's instances |
 | Private subnet | `aws_subnet` | Isolated subnet with no internet route (not used by anything yet) |
-| Public route table | `aws_route_table` + `aws_route_table_association` | Sends the public subnet's outbound traffic to the Internet Gateway |
-| Security group | `aws_security_group` | Firewall rules: SSH (22) from your IP only, HTTP (80) from anywhere |
+| Public route table | `aws_route_table` + `aws_route_table_association` | Sends both public subnets' outbound traffic to the Internet Gateway |
+| ALB security group | `aws_security_group` | Allows HTTP (80) from anywhere |
+| Instance security group | `aws_security_group` | Allows SSH (22) from your IP only, HTTP (80) only from the ALB's security group |
 | AMI lookup | `aws_ami` (data source) | Finds the latest Amazon Linux 2023 image automatically |
-| EC2 instance | `aws_instance` | A `t3.micro` VM with an 8 GB gp3 root disk, running nginx |
+| Launch template | `aws_launch_template` | Blueprint the ASG uses to launch each instance: `t3.micro`, 8 GB gp3 root disk, nginx user data |
+| Auto Scaling Group | `aws_autoscaling_group` | Keeps 1–2 instances running across both public subnets, registered with the target group |
+| Application Load Balancer | `aws_lb` | Public entry point, spread across both public subnets |
+| Target group | `aws_lb_target_group` | Tracks which instances are healthy via HTTP health checks on `/` |
+| Listener | `aws_lb_listener` | Forwards port 80 on the ALB to the target group |
 
 ---
 
@@ -74,12 +87,17 @@ In AWS terms, this project creates:
 ├── main.tf                     # Calls the vpc and ec2 modules and wires them together
 ├── outputs.tf                  # Values printed after apply (the instance's public IP)
 ├── modules/
-│   ├── vpc/                    # Reusable module: VPC, subnets, IGW, route tables
+│   ├── vpc/                    # Reusable module: VPC, 2 public + 1 private subnet, IGW, route tables
 │   │   ├── main.tf
 │   │   ├── variables.tf
 │   │   ├── outputs.tf
 │   │   └── versions.tf
-│   └── ec2/                    # Reusable module: EC2 instance, security group
+│   ├── alb/                    # Reusable module: ALB, target group, listener, ALB security group
+│   │   ├── main.tf
+│   │   ├── variables.tf
+│   │   ├── outputs.tf
+│   │   └── versions.tf
+│   └── ec2/                    # Reusable module: launch template, Auto Scaling Group, instance security group
 │       ├── main.tf
 │       ├── variables.tf
 │       ├── outputs.tf
@@ -90,13 +108,14 @@ In AWS terms, this project creates:
 ```
 
 The root project doesn't create any AWS resources directly — `main.tf` just
-calls the two modules under `modules/` and passes values between them (e.g.
-the VPC's subnet ID into the EC2 module). Terraform reads every `.tf` file
-within a single directory as one combined configuration, but a `module`
-block is a deliberate boundary: each module in `modules/` is a
+calls the three modules under `modules/` and passes values between them
+(e.g. the VPC's subnet IDs into both the ALB and EC2 modules, and the ALB's
+security group/target group into the EC2 module). Terraform reads every
+`.tf` file within a single directory as one combined configuration, but a
+`module` block is a deliberate boundary: each module in `modules/` is a
 self-contained, reusable unit with its own inputs (`variables.tf`) and
-outputs (`outputs.tf`), so either one could be dropped into another project
-as-is.
+outputs (`outputs.tf`), so any of them could be dropped into another
+project as-is.
 
 ---
 
@@ -194,7 +213,9 @@ asks you to type `yes` to confirm.
 ```bash
 terraform apply -var="my_ip_cidr=203.0.113.5/32"
 ```
-When it finishes, it prints the `instance_public_ip` output.
+When it finishes, it prints the `alb_dns_name` output. Give the ASG a
+minute or two afterward to finish booting its first instance and pass the
+ALB's health check before traffic actually succeeds.
 
 ### 5.6 `terraform destroy`
 Tears down **everything** this project created. Use this when you're done
@@ -216,16 +237,26 @@ terraform destroy -var="my_ip_cidr=203.0.113.5/32"
 
 ## 6. Verifying it worked
 
-Once `terraform apply` finishes, copy the printed `instance_public_ip` and:
+Once `terraform apply` finishes, copy the printed `alb_dns_name` and:
 
-**Check nginx is running (in a browser or via curl):**
+**Check nginx is reachable through the ALB (in a browser or via curl):**
 ```bash
-curl http://<instance_public_ip>
+curl http://<alb_dns_name>
 ```
-You should see the default nginx welcome page HTML.
+You should see the default nginx welcome page HTML. If you get a "503
+Service Temporarily Unavailable" from the ALB, the instance likely hasn't
+passed its first health check yet — wait a minute and retry.
 
-**SSH into the instance** (only works if you set `key_name` to an existing
-EC2 key pair — see section 7):
+**Check the ASG and target health** (requires the AWS CLI):
+```bash
+aws autoscaling describe-auto-scaling-groups --auto-scaling-group-names bongo-dev-web-asg
+aws elbv2 describe-target-health --target-group-arn <arn from `terraform output` or the AWS console>
+```
+
+**SSH into an instance** (only works if you set `key_name` to an existing
+EC2 key pair — see section 7). Since instances are managed by the ASG and
+no longer have a single fixed IP, look up a current instance's public IP
+in the EC2 console (or via the AWS CLI) first:
 ```bash
 ssh -i /path/to/your-key.pem ec2-user@<instance_public_ip>
 ```
@@ -237,13 +268,17 @@ ssh -i /path/to/your-key.pem ec2-user@<instance_public_ip>
 | Variable | Default | Description |
 |---|---|---|
 | `aws_region` | `us-east-1` | AWS region to deploy into |
-| `availability_zone` | `us-east-1a` | AZ for both subnets and the instance |
+| `availability_zones` | `["us-east-1a", "us-east-1b"]` | Two AZs the public subnets, ALB, and ASG span |
 | `vpc_cidr` | `10.0.0.0/16` | IP range for the whole VPC |
-| `public_subnet_cidr` | `10.0.1.0/24` | IP range for the public subnet |
+| `public_subnet_cidrs` | `["10.0.1.0/24", "10.0.3.0/24"]` | IP ranges for the two public subnets, one per AZ |
 | `private_subnet_cidr` | `10.0.2.0/24` | IP range for the private subnet |
-| `instance_type` | `t3.micro` | EC2 instance size |
+| `instance_type` | `t3.micro` | EC2 instance size used by the launch template |
 | `root_volume_size` | `8` | Root disk size in GB |
-| `my_ip_cidr` | *(required, no default)* | Your IP, e.g. `203.0.113.5/32` — allowed to SSH in |
+| `asg_min_size` | `1` | Minimum instances in the Auto Scaling Group |
+| `asg_max_size` | `2` | Maximum instances in the Auto Scaling Group |
+| `asg_desired_capacity` | `1` | Instances the ASG tries to keep running |
+| `health_check_path` | `/` | Path the ALB target group checks for instance health |
+| `my_ip_cidr` | *(required, no default)* | Your IP, e.g. `203.0.113.5/32` — allowed to SSH into instances |
 | `key_name` | `null` | Name of an existing EC2 key pair, for SSH access. Leave unset to launch without one (you won't be able to SSH in, but HTTP still works) |
 
 To use an existing key pair, pass it the same way as `my_ip_cidr`:
@@ -282,15 +317,29 @@ If you're new to Terraform, here's what each building block means:
   calling code (the root project, in this case) is itself sometimes called
   the "root module." Referencing a value a module produced looks like
   `module.vpc.vpc_id`, the same pattern as `var.` or `aws_vpc.main.id`.
+- **Launch template** — a saved "recipe" (AMI, instance type, security
+  groups, user data, etc.) an Auto Scaling Group uses every time it needs
+  to launch a new instance. It replaces hand-launching a single
+  `aws_instance`.
+- **Auto Scaling Group (ASG)** — keeps a target number of instances
+  running, launching replacements from the launch template if one is
+  terminated or fails a health check, spread across the subnets you give it.
+- **Load balancer / target group / listener** — a Load Balancer (`aws_lb`)
+  is the public entry point; a **listener** tells it what to do with
+  incoming connections on a port; a **target group** is the list of
+  backend instances it forwards them to, tracked via health checks.
 
 ---
 
 ## 9. Cost warning
 
-Everything here (`t3.micro`, an 8 GB gp3 volume, one VPC) fits within the
-AWS Free Tier for a new account, but **outside the free tier, or after your
-free tier expires, this will incur charges** for as long as it's running.
-Run `terraform destroy` when you're done to avoid unexpected costs.
+A `t3.micro` instance and an 8 GB gp3 volume fit within the AWS Free Tier
+for a new account, and the Application Load Balancer has its own separate
+(smaller) free-tier allowance for the first 12 months. **Outside the free
+tier, or after it expires, both the ALB and any running instances incur
+charges for as long as they exist** — the ALB bills hourly even if the ASG
+has scaled down to a single small instance. Run `terraform destroy` when
+you're done to avoid unexpected costs.
 
 ---
 
@@ -388,9 +437,18 @@ own state and can no longer cleanly plan or destroy its resources.
   variable. Read the error message; it names the exact file and line.
 - **`terraform apply` fails with a credentials error** — re-run
   `aws configure`, or check `aws sts get-caller-identity` works.
-- **Can't reach the instance over HTTP** — wait 1–2 minutes after apply;
-  `user_data.sh` needs a little time to run on first boot. Check the
-  security group allows port 80 from your location.
-- **Can't SSH in** — confirm you passed the correct `my_ip_cidr` (your IP
-  may have changed since your last apply) and that you passed a valid
-  `key_name` for a key pair you actually have the private key for.
+- **ALB returns 503 Service Temporarily Unavailable** — normal for the
+  first minute or two after apply, while the ASG's instance boots and runs
+  `user_data.sh`. Check target health with
+  `aws elbv2 describe-target-health --target-group-arn <arn>`; if a target
+  stays `unhealthy` past the `health_check_grace_period` (300s), SSH in and
+  check `sudo systemctl status nginx` and `sudo cat /var/log/cloud-init-output.log`.
+- **Can't SSH into an instance** — confirm you passed the correct
+  `my_ip_cidr` (your IP may have changed since your last apply), that you
+  passed a valid `key_name` for a key pair you actually have the private
+  key for, and that you're using a *current* instance's public IP (the ASG
+  can replace instances, so an old IP will no longer answer).
+- **ASG shows 0 healthy instances but `desired_capacity` is 1** — give it
+  a few minutes; a fresh instance needs to boot, run user data, and pass at
+  least 2 consecutive health checks (roughly a minute apart) before the
+  target group marks it healthy.

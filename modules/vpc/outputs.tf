@@ -1,14 +1,11 @@
-# Outputs are how a module hands values back to whatever called it (here,
-# the root module) — the root reads these as module.vpc.<output_name>.
-
 output "vpc_id" {
   description = "ID of the VPC."
   value       = aws_vpc.main.id
 }
 
-output "public_subnet_id" {
-  description = "ID of the public subnet."
-  value       = aws_subnet.public.id
+output "public_subnet_ids" {
+  description = "IDs of both public subnets, one per AZ."
+  value       = aws_subnet.public[*].id
 }
 
 output "private_subnet_id" {

@@ -1,8 +1,8 @@
-# This module builds a minimal, isolated network: one VPC containing a
-# "public" subnet (reachable from the internet) and a "private" subnet
-# (not reachable from the internet). Only the public subnet is used by the
-# ec2 module today; the private one is scaffolding for future resources
-# (e.g. a database) that shouldn't be internet-facing.
+# This module builds a network with TWO public subnets in two different
+# availability zones (required for the ALB and ASG, which both need to
+# spread across AZs for high availability) plus one private subnet
+# (not reachable from the internet — scaffolding for future resources
+# like a database).
 
 # The VPC (Virtual Private Cloud) is the network boundary everything else
 # lives inside — its own private address space, isolated from other VPCs.
@@ -27,25 +27,29 @@ resource "aws_internet_gateway" "main" {
   }
 }
 
-# Public subnet: instances here can get a public IP and reach the internet
-# via the Internet Gateway, once the route table below is associated with it.
+# Two public subnets, one per AZ. `count` here creates one aws_subnet per
+# entry in availability_zones, indexing into public_subnet_cidrs the same
+# way — count.index is 0 then 1.
 resource "aws_subnet" "public" {
+  count = length(var.availability_zones)
+
   vpc_id                  = aws_vpc.main.id
-  cidr_block              = var.public_subnet_cidr
-  availability_zone       = var.availability_zone
+  cidr_block              = var.public_subnet_cidrs[count.index]
+  availability_zone       = var.availability_zones[count.index]
   map_public_ip_on_launch = true # auto-assign a public IP to instances launched here
 
   tags = {
-    Name = "bongo-dev-public-subnet"
+    Name = "bongo-dev-public-subnet-${count.index + 1}"
   }
 }
 
 # Private subnet: no route to the Internet Gateway, so nothing here is
-# directly reachable from (or can directly reach) the internet.
+# directly reachable from (or can directly reach) the internet. Only one is
+# needed today, so it just uses the first availability zone.
 resource "aws_subnet" "private" {
   vpc_id            = aws_vpc.main.id
   cidr_block        = var.private_subnet_cidr
-  availability_zone = var.availability_zone
+  availability_zone = var.availability_zones[0]
 
   tags = {
     Name = "bongo-dev-private-subnet"
@@ -54,7 +58,8 @@ resource "aws_subnet" "private" {
 
 # A route table is a set of rules for where network traffic is allowed to go.
 # This one sends all traffic not destined for the VPC (0.0.0.0/0) out through
-# the Internet Gateway — that's what makes a subnet "public".
+# the Internet Gateway — that's what makes a subnet "public". Both public
+# subnets share this single route table.
 resource "aws_route_table" "public" {
   vpc_id = aws_vpc.main.id
 
@@ -69,8 +74,10 @@ resource "aws_route_table" "public" {
 }
 
 # A route table does nothing until it's associated with a subnet — this
-# association is what actually makes aws_subnet.public "public".
+# associates it with both public subnets.
 resource "aws_route_table_association" "public" {
-  subnet_id      = aws_subnet.public.id
+  count = length(aws_subnet.public)
+
+  subnet_id      = aws_subnet.public[count.index].id
   route_table_id = aws_route_table.public.id
 }
