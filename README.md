@@ -69,18 +69,34 @@ In AWS terms, this project creates:
 
 ```
 .
-├── providers.tf        # Which cloud provider (AWS) and version to use
-├── variables.tf         # All configurable inputs (region, CIDRs, your IP, etc.)
-├── main.tf               # The actual resources: VPC, subnets, security group, EC2 instance
-├── outputs.tf            # Values printed after apply (the instance's public IP)
-├── user_data.sh          # Shell script that installs & starts nginx on first boot
-├── .gitignore            # Files Terraform generates locally that shouldn't be committed
-└── .terraform.lock.hcl   # Records exact provider versions used (should be committed)
+├── providers.tf              # Which cloud provider (AWS) and version to use
+├── variables.tf               # All configurable inputs (region, CIDRs, your IP, etc.)
+├── main.tf                     # Calls the vpc and ec2 modules and wires them together
+├── outputs.tf                  # Values printed after apply (the instance's public IP)
+├── modules/
+│   ├── vpc/                    # Reusable module: VPC, subnets, IGW, route tables
+│   │   ├── main.tf
+│   │   ├── variables.tf
+│   │   ├── outputs.tf
+│   │   └── versions.tf
+│   └── ec2/                    # Reusable module: EC2 instance, security group
+│       ├── main.tf
+│       ├── variables.tf
+│       ├── outputs.tf
+│       ├── versions.tf
+│       └── user_data.sh        # Installs & starts nginx on first boot
+├── .gitignore                  # Files Terraform generates locally that shouldn't be committed
+└── .terraform.lock.hcl         # Records exact provider versions used (should be committed)
 ```
 
-Terraform doesn't care how you split files — it reads every `.tf` file in
-the directory as one combined configuration. They're split by purpose here
-purely for readability.
+The root project doesn't create any AWS resources directly — `main.tf` just
+calls the two modules under `modules/` and passes values between them (e.g.
+the VPC's subnet ID into the EC2 module). Terraform reads every `.tf` file
+within a single directory as one combined configuration, but a `module`
+block is a deliberate boundary: each module in `modules/` is a
+self-contained, reusable unit with its own inputs (`variables.tf`) and
+outputs (`outputs.tf`), so either one could be dropped into another project
+as-is.
 
 ---
 
@@ -260,6 +276,12 @@ If you're new to Terraform, here's what each building block means:
   via version control without a proper remote backend).
 - **Plan / Apply** — Terraform's two-step safety model: `plan` shows you
   the changes *before* anything happens, `apply` executes them.
+- **Module** — a self-contained, reusable group of resources with its own
+  inputs and outputs, called from elsewhere with a `module` block, e.g.
+  `module "vpc" { source = "./modules/vpc" vpc_cidr = var.vpc_cidr }`. The
+  calling code (the root project, in this case) is itself sometimes called
+  the "root module." Referencing a value a module produced looks like
+  `module.vpc.vpc_id`, the same pattern as `var.` or `aws_vpc.main.id`.
 
 ---
 
