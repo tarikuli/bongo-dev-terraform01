@@ -8,6 +8,10 @@ terraform {
       source  = "hashicorp/aws" # where to download the provider from (Terraform Registry)
       version = "~> 5.0"        # "~> 5.0" means "any 5.x version, but not 6.0"
     }
+    random = {
+      source  = "hashicorp/random" # used by modules/rds to generate the master password
+      version = "~> 3.6"
+    }
   }
 }
 

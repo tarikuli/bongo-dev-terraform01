@@ -1,8 +1,9 @@
-# This module builds a network with TWO public subnets in two different
-# availability zones (required for the ALB and ASG, which both need to
-# spread across AZs for high availability) plus one private subnet
-# (not reachable from the internet — scaffolding for future resources
-# like a database).
+# This module builds a network with TWO public subnets and TWO private
+# subnets, one of each per availability zone. The public subnets are
+# required for the ALB and ASG (both need to spread across AZs for high
+# availability); the private subnets aren't reachable from the internet and
+# host things like the RDS database, which also requires 2 AZs for its
+# DB subnet group even when Multi-AZ failover itself is disabled.
 
 # The VPC (Virtual Private Cloud) is the network boundary everything else
 # lives inside — its own private address space, isolated from other VPCs.
@@ -43,16 +44,19 @@ resource "aws_subnet" "public" {
   }
 }
 
-# Private subnet: no route to the Internet Gateway, so nothing here is
-# directly reachable from (or can directly reach) the internet. Only one is
-# needed today, so it just uses the first availability zone.
+# Two private subnets, one per AZ — same pattern as the public subnets, but
+# with no route to the Internet Gateway, so nothing here is directly
+# reachable from (or can directly reach) the internet. RDS requires a DB
+# subnet group spanning 2 AZs even with Multi-AZ failover turned off.
 resource "aws_subnet" "private" {
+  count = length(var.availability_zones)
+
   vpc_id            = aws_vpc.main.id
-  cidr_block        = var.private_subnet_cidr
-  availability_zone = var.availability_zones[0]
+  cidr_block        = var.private_subnet_cidrs[count.index]
+  availability_zone = var.availability_zones[count.index]
 
   tags = {
-    Name = "bongo-dev-private-subnet"
+    Name = "bongo-dev-private-subnet-${count.index + 1}"
   }
 }
 

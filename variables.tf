@@ -32,10 +32,10 @@ variable "public_subnet_cidrs" {
   default     = ["10.0.1.0/24", "10.0.3.0/24"]
 }
 
-variable "private_subnet_cidr" {
-  description = "CIDR block for the private subnet."
-  type        = string
-  default     = "10.0.2.0/24"
+variable "private_subnet_cidrs" {
+  description = "CIDR blocks for the two private subnets (one per AZ in availability_zones) — used by RDS's DB subnet group."
+  type        = list(string)
+  default     = ["10.0.2.0/24", "10.0.4.0/24"]
 }
 
 variable "instance_type" {
@@ -97,4 +97,45 @@ variable "key_name" {
   description = "Name of an existing EC2 key pair to associate with the instance for SSH access. Leave null to launch without a key pair."
   type        = string
   default     = null
+}
+
+# --- RDS ---
+# The master password is deliberately NOT a variable here — it's generated
+# randomly by modules/rds and stored in Secrets Manager instead. See
+# modules/rds/main.tf's random_password resource.
+
+variable "db_instance_class" {
+  description = "RDS instance class."
+  type        = string
+  default     = "db.t4g.micro"
+}
+
+variable "db_allocated_storage" {
+  description = "RDS allocated storage in GB."
+  type        = number
+  default     = 20
+}
+
+variable "db_engine_version" {
+  description = "MySQL engine version."
+  type        = string
+  default     = "8.0"
+}
+
+variable "db_name" {
+  description = "Name of the initial database created on the RDS instance."
+  type        = string
+  default     = "appdb"
+}
+
+variable "db_username" {
+  description = "RDS master username (not the password — see above)."
+  type        = string
+  default     = "dbadmin"
+}
+
+variable "db_backup_retention_days" {
+  description = "Days to retain automated RDS backups. 0 disables them — fine for a learning project, raise it for anything real."
+  type        = number
+  default     = 0
 }

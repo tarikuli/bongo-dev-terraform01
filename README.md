@@ -1,9 +1,10 @@
 # bongo-dev-terraform01
 
 A beginner-friendly Terraform project that provisions a small, self-contained
-AWS environment: a VPC with two public subnets (across two AZs) and a
-private subnet, an Application Load Balancer, and an Auto Scaling Group of
-EC2 instances running nginx behind it.
+AWS environment: a VPC with two public and two private subnets (across two
+AZs), an Application Load Balancer, an Auto Scaling Group of EC2 instances
+running nginx behind it, and a private MySQL RDS database the instances can
+reach but the internet can't.
 
 This README explains not just *how* to run it, but *what* each piece is,
 so it doubles as a learning guide if you're new to Terraform or AWS
@@ -48,12 +49,20 @@ networking.
   │              │    - 22  from YOUR IP                    │        │
   │              │    - 80  from the ALB's security group   │        │
   │              └───────────────────────────────────────────┘        │
-  │                                                                    │
-  │   ┌──────────────────────────────────────────────┐               │
-  │   │  Private Subnet  10.0.2.0/24                  │               │
-  │   │  (no route to the internet — empty for now,   │               │
-  │   │   scaffolding for things like a database)     │               │
-  │   └────────────────────────────────────────────────┘             │
+  │                        │                                          │
+  │           ┌────────────┴─────────────┐                            │
+  │           │ MySQL :3306, from the    │                            │
+  │           │ instance SG only         │                            │
+  │  ┌────────▼────────┐      ┌──────────▼───────┐                    │
+  │  │Private Subnet 1  │      │Private Subnet 2  │                   │
+  │  │10.0.2.0/24  AZ a │      │10.0.4.0/24  AZ b │                   │
+  │  │                  │      │                  │                   │
+  │  │   ┌──────────────▼──────────────┐          │                   │
+  │  │   │  RDS MySQL (db.t4g.micro)   │          │                   │
+  │  │   │  20GB gp3, single-AZ         │          │                   │
+  │  │   │  password → Secrets Manager  │          │                   │
+  │  │   └──────────────────────────────┘          │                   │
+  │  └──────────────────┘      └──────────────────┘                   │
   │                                                                    │
   └────────────────────────────────────────────────────────────────────┘
 ```
@@ -65,7 +74,7 @@ In AWS terms, this project creates:
 | VPC | `aws_vpc` | An isolated network with its own private IP range |
 | Internet Gateway | `aws_internet_gateway` | Connects the VPC to the public internet |
 | Public subnets (×2) | `aws_subnet` | One per AZ; host the ALB and the ASG's instances |
-| Private subnet | `aws_subnet` | Isolated subnet with no internet route (not used by anything yet) |
+| Private subnets (×2) | `aws_subnet` | One per AZ; host the RDS database, unreachable from the internet |
 | Public route table | `aws_route_table` + `aws_route_table_association` | Sends both public subnets' outbound traffic to the Internet Gateway |
 | ALB security group | `aws_security_group` | Allows HTTP (80) from anywhere |
 | Instance security group | `aws_security_group` | Allows SSH (22) from your IP only, HTTP (80) only from the ALB's security group |
@@ -75,6 +84,11 @@ In AWS terms, this project creates:
 | Application Load Balancer | `aws_lb` | Public entry point, spread across both public subnets |
 | Target group | `aws_lb_target_group` | Tracks which instances are healthy via HTTP health checks on `/` |
 | Listener | `aws_lb_listener` | Forwards port 80 on the ALB to the target group |
+| DB subnet group | `aws_db_subnet_group` | Tells RDS which (private) subnets it may use |
+| RDS security group | `aws_security_group` | Allows MySQL (3306) only from the instance security group |
+| Random password | `random_password` | Generates the RDS master password — never a plaintext variable |
+| Secrets Manager secret | `aws_secretsmanager_secret` + `..._secret_version` | Stores the generated username/password |
+| RDS instance | `aws_db_instance` | MySQL 8.0, `db.t4g.micro`, 20 GB gp3, single-AZ, in the private subnets |
 
 ---
 
@@ -87,7 +101,7 @@ In AWS terms, this project creates:
 ├── main.tf                     # Calls the vpc and ec2 modules and wires them together
 ├── outputs.tf                  # Values printed after apply (the instance's public IP)
 ├── modules/
-│   ├── vpc/                    # Reusable module: VPC, 2 public + 1 private subnet, IGW, route tables
+│   ├── vpc/                    # Reusable module: VPC, 2 public + 2 private subnets, IGW, route tables
 │   │   ├── main.tf
 │   │   ├── variables.tf
 │   │   ├── outputs.tf
@@ -97,25 +111,31 @@ In AWS terms, this project creates:
 │   │   ├── variables.tf
 │   │   ├── outputs.tf
 │   │   └── versions.tf
-│   └── ec2/                    # Reusable module: launch template, Auto Scaling Group, instance security group
+│   ├── ec2/                    # Reusable module: launch template, Auto Scaling Group, instance security group
+│   │   ├── main.tf
+│   │   ├── variables.tf
+│   │   ├── outputs.tf
+│   │   ├── versions.tf
+│   │   └── user_data.sh        # Installs & starts nginx on first boot
+│   └── rds/                    # Reusable module: RDS MySQL, DB subnet group, RDS security group, Secrets Manager
 │       ├── main.tf
 │       ├── variables.tf
 │       ├── outputs.tf
-│       ├── versions.tf
-│       └── user_data.sh        # Installs & starts nginx on first boot
+│       └── versions.tf
 ├── .gitignore                  # Files Terraform generates locally that shouldn't be committed
 └── .terraform.lock.hcl         # Records exact provider versions used (should be committed)
 ```
 
 The root project doesn't create any AWS resources directly — `main.tf` just
-calls the three modules under `modules/` and passes values between them
-(e.g. the VPC's subnet IDs into both the ALB and EC2 modules, and the ALB's
-security group/target group into the EC2 module). Terraform reads every
-`.tf` file within a single directory as one combined configuration, but a
-`module` block is a deliberate boundary: each module in `modules/` is a
-self-contained, reusable unit with its own inputs (`variables.tf`) and
-outputs (`outputs.tf`), so any of them could be dropped into another
-project as-is.
+calls the four modules under `modules/` and passes values between them
+(e.g. the VPC's subnet IDs into the ALB/EC2/RDS modules, the ALB's security
+group/target group into the EC2 module, and the EC2 module's security
+group into the RDS module). Terraform reads every `.tf` file within a
+single directory as one combined configuration, but a `module` block is a
+deliberate boundary: each module in `modules/` is a self-contained,
+reusable unit with its own inputs (`variables.tf`) and outputs
+(`outputs.tf`), so any of them could be dropped into another project
+as-is.
 
 ---
 
@@ -271,7 +291,7 @@ ssh -i /path/to/your-key.pem ec2-user@<instance_public_ip>
 | `availability_zones` | `["us-east-1a", "us-east-1b"]` | Two AZs the public subnets, ALB, and ASG span |
 | `vpc_cidr` | `10.0.0.0/16` | IP range for the whole VPC |
 | `public_subnet_cidrs` | `["10.0.1.0/24", "10.0.3.0/24"]` | IP ranges for the two public subnets, one per AZ |
-| `private_subnet_cidr` | `10.0.2.0/24` | IP range for the private subnet |
+| `private_subnet_cidrs` | `["10.0.2.0/24", "10.0.4.0/24"]` | IP ranges for the two private subnets, one per AZ |
 | `instance_type` | `t3.micro` | EC2 instance size used by the launch template |
 | `root_volume_size` | `8` | Root disk size in GB |
 | `asg_min_size` | `1` | Minimum instances in the Auto Scaling Group |
@@ -280,6 +300,12 @@ ssh -i /path/to/your-key.pem ec2-user@<instance_public_ip>
 | `health_check_path` | `/` | Path the ALB target group checks for instance health |
 | `my_ip_cidr` | *(required, no default)* | Your IP, e.g. `203.0.113.5/32` — allowed to SSH into instances |
 | `key_name` | `null` | Name of an existing EC2 key pair, for SSH access. Leave unset to launch without one (you won't be able to SSH in, but HTTP still works) |
+| `db_instance_class` | `db.t4g.micro` | RDS instance class |
+| `db_allocated_storage` | `20` | RDS storage size in GB (gp3) |
+| `db_engine_version` | `8.0` | MySQL engine version |
+| `db_name` | `appdb` | Initial database created on the RDS instance |
+| `db_username` | `dbadmin` | RDS master username (the password is generated randomly — see § 8) |
+| `db_backup_retention_days` | `0` | Days of automated RDS backups to keep; `0` disables them |
 
 To use an existing key pair, pass it the same way as `my_ip_cidr`:
 ```bash
@@ -288,7 +314,51 @@ To use an existing key pair, pass it the same way as `my_ip_cidr`:
 
 ---
 
-## 8. Terraform concepts used in this project (glossary)
+## 8. Accessing the database
+
+There's no `db_password` variable anywhere in this project — on purpose.
+`modules/rds` generates the master password randomly with a
+`random_password` resource and stores it in AWS Secrets Manager, alongside
+the username, as a JSON secret. The only thing about the database this
+project ever prints is its non-secret connection endpoint
+(`rds_endpoint`).
+
+**To retrieve the password** (requires the AWS CLI and `jq`):
+```bash
+SECRET_ARN=$(terraform output -raw rds_secret_arn)
+aws secretsmanager get-secret-value --secret-id "$SECRET_ARN" --query SecretString --output text | jq .
+```
+This prints `{"username": "...", "password": "..."}`.
+
+**To connect with the MySQL client**, from something that's actually
+inside the VPC and covered by the instance security group — e.g. SSH into
+an EC2 instance first, since the RDS security group rejects connections
+from anywhere else, including your own machine:
+```bash
+mysql -h <rds_endpoint host, no port> -u <username> -p
+```
+
+A couple of things worth understanding about how this is wired:
+- **Why generate the password instead of asking for it in a variable?** A
+  variable's value is easy to leak by accident — committed in a
+  `terraform.tfvars` file, left in shell history, printed in a CI log.
+  Generating it and only ever handling it as a Terraform-managed secret
+  avoids all of that.
+- **The password still ends up in `terraform.tfstate`, in plaintext.**
+  This is unavoidable — Terraform has to know the value to set it on the
+  RDS instance and write it to Secrets Manager. It's exactly why state
+  should live in an encrypted backend rather than as a local file — see
+  the remote state section below.
+- **Why not read the password back out of Secrets Manager into
+  `aws_db_instance`?** That would create a circular dependency: the secret
+  can't contain the RDS endpoint until the instance exists, but the
+  instance needs a password before it can be created. Generating the
+  password once and feeding it to both the RDS instance and the secret
+  avoids the cycle.
+
+---
+
+## 9. Terraform concepts used in this project (glossary)
 
 If you're new to Terraform, here's what each building block means:
 
@@ -328,22 +398,30 @@ If you're new to Terraform, here's what each building block means:
   is the public entry point; a **listener** tells it what to do with
   incoming connections on a port; a **target group** is the list of
   backend instances it forwards them to, tracked via health checks.
+- **`random_password` / Secrets Manager** — `random_password` is a
+  Terraform-only resource (no AWS API call) that generates a random value
+  entirely within Terraform, used here so the RDS master password is never
+  typed into a variable. Secrets Manager is a separate AWS service for
+  actually *storing* secrets like that password, so applications (or you)
+  can look them up by name/ARN instead of it living in a config file.
 
 ---
 
-## 9. Cost warning
+## 10. Cost warning
 
-A `t3.micro` instance and an 8 GB gp3 volume fit within the AWS Free Tier
-for a new account, and the Application Load Balancer has its own separate
-(smaller) free-tier allowance for the first 12 months. **Outside the free
-tier, or after it expires, both the ALB and any running instances incur
-charges for as long as they exist** — the ALB bills hourly even if the ASG
-has scaled down to a single small instance. Run `terraform destroy` when
-you're done to avoid unexpected costs.
+A `t3.micro` instance, an 8 GB gp3 volume, and a `db.t4g.micro` RDS
+instance all fit within the AWS Free Tier for a new account (RDS's free
+tier covers 750 hours/month of a `db.t2/t3/t4g.micro` instance), and the
+Application Load Balancer has its own separate (smaller) free-tier
+allowance for the first 12 months. **Outside the free tier, or after it
+expires, the ALB, RDS instance, and any running EC2 instances all incur
+charges for as long as they exist** — the ALB and RDS both bill hourly even
+if the ASG has scaled down to a single small instance. Run
+`terraform destroy` when you're done to avoid unexpected costs.
 
 ---
 
-## 10. Remote state (`bootstrap/`)
+## 11. Remote state (`bootstrap/`)
 
 By default, Terraform stores its state (`terraform.tfstate`) as a local
 file. That's fine solo, but breaks down the moment more than one person or
@@ -431,7 +509,7 @@ own state and can no longer cleanly plan or destroy its resources.
 
 ---
 
-## 11. Troubleshooting
+## 12. Troubleshooting
 
 - **`terraform validate` fails** — usually a typo or missing required
   variable. Read the error message; it names the exact file and line.
@@ -452,3 +530,12 @@ own state and can no longer cleanly plan or destroy its resources.
   a few minutes; a fresh instance needs to boot, run user data, and pass at
   least 2 consecutive health checks (roughly a minute apart) before the
   target group marks it healthy.
+- **Can't connect to MySQL** — the RDS security group only allows port
+  3306 from the EC2/ASG security group, so you can only connect from
+  inside the VPC (e.g. after SSHing into an instance) — not from your own
+  machine directly, even with the right password.
+- **`terraform apply` (or `destroy` then `apply` again) fails on the
+  Secrets Manager secret** ("already scheduled for deletion" or similar) —
+  this shouldn't happen here since `recovery_window_in_days = 0` deletes
+  the secret immediately on destroy, but if you changed that, AWS keeps a
+  deleted secret's name reserved for up to 30 days by default.
