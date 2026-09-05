@@ -1,0 +1,17 @@
+# Copy this into backend.tf in the ROOT project (not bootstrap/) once the
+# bootstrap config has been applied and you have its outputs.
+#
+# IMPORTANT: backend blocks cannot reference variables, data sources, or
+# outputs from elsewhere — every value here must be a hardcoded literal.
+# This is a Terraform limitation: the backend has to be knowable before
+# Terraform has evaluated anything else in the config.
+
+terraform {
+  backend "s3" {
+    bucket         = "bongo-dev-tfstate-<your-account-id>"  # from: terraform output state_bucket_name
+    key            = "bongo-dev-terraform01/terraform.tfstate"
+    region         = "us-east-1"
+    dynamodb_table = "bongo-dev-terraform-locks"              # from: terraform output dynamodb_table_name
+    encrypt        = true
+  }
+}

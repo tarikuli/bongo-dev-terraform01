@@ -272,7 +272,95 @@ Run `terraform destroy` when you're done to avoid unexpected costs.
 
 ---
 
-## 10. Troubleshooting
+## 10. Remote state (`bootstrap/`)
+
+By default, Terraform stores its state (`terraform.tfstate`) as a local
+file. That's fine solo, but breaks down the moment more than one person or
+machine runs `apply` — there's no locking and nothing shared. The
+`bootstrap/` folder sets up **remote state**: an S3 bucket to hold the
+state file, and a DynamoDB table Terraform uses to lock it during
+`plan`/`apply` so two runs can't collide.
+
+### Why a separate folder?
+
+A backend config tells Terraform *where* to store its state — but Terraform
+has to know that before it can do anything else. A config can't create the
+S3 bucket and DynamoDB table it also uses as its own backend (that's a
+chicken-and-egg problem). So `bootstrap/` is a small, independent Terraform
+project with its own local state, whose only job is to create those two
+resources once.
+
+### What's in `bootstrap/`
+
+| File | Purpose |
+|---|---|
+| `bootstrap/providers.tf` | Same AWS provider setup as the root project |
+| `bootstrap/variables.tf` | `aws_region`, `project_name` (used to name the bucket/table) |
+| `bootstrap/main.tf` | The S3 bucket (versioned + encrypted + public access blocked) and the DynamoDB lock table |
+| `bootstrap/outputs.tf` | Prints the bucket name and table name you'll need next |
+
+### Step-by-step: setting up remote state
+
+**Step 1 — apply the bootstrap config** (creates the bucket and table; its
+own state stays local, inside `bootstrap/`):
+```bash
+cd bootstrap
+terraform init
+terraform plan
+terraform apply
+```
+
+**Step 2 — copy the output values:**
+```bash
+terraform output state_bucket_name
+terraform output dynamodb_table_name
+```
+
+**Step 3 — add `backend.tf` to the root project.** A template is provided
+at `backend.tf.example` — copy it and fill in the real values:
+```bash
+cd ..
+cp backend.tf.example backend.tf
+```
+Then edit `backend.tf` and replace the bucket/table placeholders with the
+values from Step 2. Backend blocks **cannot** use variables or outputs —
+every value must be a literal string, because Terraform needs to know
+where the state lives before it can evaluate anything else in the config.
+
+**Step 4 — re-initialize the root project.** Terraform detects that a
+backend was just added and offers to migrate your existing local state
+into it:
+```bash
+terraform init
+```
+You'll see a prompt like:
+```
+Initializing the backend...
+Do you want to copy existing state to the new backend?
+  Enter "yes" to copy...
+```
+Type `yes`. From this point on, `terraform plan`/`apply`/`destroy` in the
+root project read and write state in S3, locked via DynamoDB, instead of
+the local `terraform.tfstate` file.
+
+### Order of operations, summarized
+
+1. `bootstrap/` — `init` → `plan` → `apply` (creates the bucket + table)
+2. Root project — add `backend.tf` using the bootstrap outputs
+3. Root project — `terraform init` (migrates local state into S3)
+4. Root project — continue using `plan`/`apply`/`destroy` as normal
+
+### Tearing down (reverse order matters)
+
+If you ever want to remove everything, destroy in the **opposite** order:
+first `terraform destroy` in the root project (while it can still reach its
+state in S3), *then* `terraform destroy` in `bootstrap/`. If you destroy
+the S3 bucket/DynamoDB table first, the root project loses access to its
+own state and can no longer cleanly plan or destroy its resources.
+
+---
+
+## 11. Troubleshooting
 
 - **`terraform validate` fails** — usually a typo or missing required
   variable. Read the error message; it names the exact file and line.
