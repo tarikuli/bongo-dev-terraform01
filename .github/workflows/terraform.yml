@@ -1,0 +1,175 @@
+name: Terraform
+
+# Two triggers, matching the two jobs below:
+# - A pull request targeting main runs the "plan" job: fmt check, init,
+#   validate, plan, and a PR comment with the plan output. Nothing is
+#   actually created or changed in AWS.
+# - A push to main (i.e. a PR merge, or a direct push) runs the "apply"
+#   job, which applies that plan for real.
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+# Lets the workflow read repo contents (to check out the code) and write
+# pull request comments (to post the plan). Both default to read-only
+# otherwise.
+permissions:
+  contents: read
+  pull-requests: write
+
+# Terraform state locking (via the DynamoDB table from the bootstrap/
+# backend) would make two concurrent runs on the same ref queue up and
+# wait rather than fail outright, but serializing them here up front is
+# simpler to reason about: only one workflow run per branch at a time.
+concurrency:
+  group: terraform-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  # Falls back to us-east-1 (this project's default region) if no
+  # repository/organization variable named AWS_REGION is set.
+  AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
+  # Terraform automatically reads any TF_VAR_<name> environment variable as
+  # the value for variable "<name>" — this is how my_ip_cidr (which has no
+  # default, on purpose — see variables.tf) gets set in CI without a
+  # -var flag on every command. Add a repository secret named MY_IP_CIDR
+  # (e.g. your office/VPN's IP as a /32, or a CIDR covering your CI
+  # runners if you want SSH reachable from there) before running this
+  # workflow for real.
+  TF_VAR_my_ip_cidr: ${{ secrets.MY_IP_CIDR }}
+  # Trims Terraform's output of interactive-use suggestions ("run terraform
+  # plan next", etc.) that don't make sense in CI logs.
+  TF_IN_AUTOMATION: "true"
+
+jobs:
+  plan:
+    name: Plan
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.16.0"
+          # Wraps the terraform binary so each step below exposes its
+          # stdout/stderr/exit code as step outputs (steps.<id>.outputs.*) —
+          # that's what lets the "Comment plan on PR" step below read back
+          # what `terraform plan` printed.
+          terraform_wrapper: true
+
+      # Checks formatting across the whole project (root + modules/ +
+      # bootstrap/), not just the current directory.
+      - name: Terraform fmt
+        id: fmt
+        run: terraform fmt -check -recursive -diff
+
+      - name: Terraform init
+        id: init
+        run: terraform init -input=false
+
+      - name: Terraform validate
+        id: validate
+        run: terraform validate -no-color
+
+      # continue-on-error here is deliberate: even if the plan fails, we
+      # still want to post that failure to the PR (next step) rather than
+      # just leaving a red X with no detail. The job is failed explicitly
+      # afterward, once the comment is posted.
+      - name: Terraform plan
+        id: plan
+        run: terraform plan -no-color -input=false -lock-timeout=5m
+        continue-on-error: true
+
+      - name: Comment plan on PR
+        uses: actions/github-script@v7
+        env:
+          PLAN: "${{ steps.plan.outputs.stdout }}${{ steps.plan.outputs.stderr }}"
+        with:
+          script: |
+            const marker = "<!-- terraform-plan-comment -->";
+            const outcome = "${{ steps.plan.outcome }}";
+            const plan = process.env.PLAN || "(no plan output captured)";
+            const truncated = plan.length > 60000
+              ? plan.slice(0, 60000) + "\n\n... (truncated, see the workflow run for the full plan)"
+              : plan;
+
+            const body = `${marker}
+            ### Terraform Plan — ${outcome === "success" ? "✅ Success" : "❌ Failed"}
+
+            <details><summary>Show plan output</summary>
+
+            \`\`\`terraform
+            ${truncated}
+            \`\`\`
+
+            </details>
+
+            *Workflow run: ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}*`;
+
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+            });
+            const existing = comments.find((c) => c.body.includes(marker));
+
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: existing.id,
+                body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body,
+              });
+            }
+
+      - name: Fail job if plan failed
+        if: steps.plan.outcome == 'failure'
+        run: exit 1
+
+  apply:
+    name: Apply
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.16.0"
+
+      - name: Terraform init
+        run: terraform init -input=false
+
+      - name: Terraform validate
+        run: terraform validate -no-color
+
+      - name: Terraform apply
+        run: terraform apply -auto-approve -input=false -lock-timeout=5m
